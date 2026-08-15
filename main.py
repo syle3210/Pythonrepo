@@ -2,45 +2,48 @@ from flask import Flask, request, Response, stream_with_context
 from flask_cors import CORS
 import requests
 import os
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app)
 
 @app.route('/', methods=['GET'])
 def home():
     return {
         "status": "JProxy-style proxy is running",
-        "usage": "/proxy?url=https://integrate.api.nvidia.com/v1"
+        "usage": "Use: /proxy?url=https://integrate.api.nvidia.com/v1"
     }
 
-@app.route('/proxy', methods=['GET', 'POST', 'OPTIONS'])
-@app.route('/proxy/', methods=['GET', 'POST', 'OPTIONS'])
-@app.route('/proxy/<path:path>', methods=['GET', 'POST', 'OPTIONS'])
-def proxy(path=''):
+@app.route('/proxy', methods=['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'])
+@app.route('/proxy/', methods=['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'])
+@app.route('/proxy/<path:subpath>', methods=['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'])
+def proxy(subpath=None):
     if request.method == 'OPTIONS':
-        return '', 204
+        return Response('', status=204)
 
-    target_url = request.args.get('url')
-    if not target_url:
+    target = request.args.get('url')
+    if not target:
         return {"error": "Missing ?url= parameter"}, 400
 
-    # Build full target URL
-    if path:
-        full_url = f"{target_url.rstrip('/')}/{path.lstrip('/')}"
-    else:
-        full_url = target_url.rstrip('/')
+    # Clean target
+    target = target.rstrip('/')
 
-    # Keep extra query params (except url)
-    query_params = {k: v for k, v in request.args.items() if k != 'url'}
-    if query_params:
-        full_url += '?' + urlencode(query_params)
+    # If Janitor or the client appended a path after /proxy, add it
+    if subpath:
+        full_url = f"{target}/{subpath.lstrip('/')}"
+    else:
+        full_url = target
+
+    # Preserve other query parameters
+    extra_params = {k: v for k, v in request.args.items() if k != 'url'}
+    if extra_params:
+        full_url += ('&' if '?' in full_url else '?') + urlencode(extra_params)
 
     # Forward headers
     headers = {}
     for key, value in request.headers:
-        key_lower = key.lower()
-        if key_lower not in ['host', 'content-length', 'transfer-encoding']:
+        kl = key.lower()
+        if kl not in ['host', 'content-length', 'transfer-encoding', 'connection']:
             headers[key] = value
 
     try:
@@ -55,10 +58,7 @@ def proxy(path=''):
         )
 
         excluded = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-        response_headers = [
-            (name, value) for name, value in resp.headers.items()
-            if name.lower() not in excluded
-        ]
+        response_headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in excluded]
 
         def generate():
             for chunk in resp.iter_content(chunk_size=8192):
@@ -73,6 +73,18 @@ def proxy(path=''):
 
     except Exception as e:
         return {"error": str(e)}, 500
+
+
+# Catch-all so we can see what path is actually being requested
+@app.route('/<path:path>', methods=['GET', 'POST', 'OPTIONS'])
+def catch_all(path):
+    return {
+        "error": "Route not found",
+        "requested_path": path,
+        "method": request.method,
+        "full_url": request.url,
+        "hint": "You should use /proxy?url=https://integrate.api.nvidia.com/v1"
+    }, 404
 
 
 if __name__ == '__main__':
