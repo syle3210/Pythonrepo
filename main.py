@@ -2,7 +2,7 @@ from flask import Flask, request, Response, stream_with_context
 from flask_cors import CORS
 import requests
 import os
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urljoin, urlencode
 
 app = Flask(__name__)
 CORS(app)
@@ -11,12 +11,12 @@ CORS(app)
 def home():
     return {
         "status": "JProxy-style proxy is running",
-        "usage": "Use: /proxy?url=https://integrate.api.nvidia.com/v1"
+        "usage": "/proxy?url=https://integrate.api.nvidia.com/v1"
     }
 
-@app.route('/proxy', methods=['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'])
-@app.route('/proxy/', methods=['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'])
-@app.route('/proxy/<path:subpath>', methods=['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'])
+@app.route('/proxy', methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/proxy/', methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/proxy/<path:subpath>', methods=['GET', 'POST', 'OPTIONS'])
 def proxy(subpath=None):
     if request.method == 'OPTIONS':
         return Response('', status=204)
@@ -25,19 +25,26 @@ def proxy(subpath=None):
     if not target:
         return {"error": "Missing ?url= parameter"}, 400
 
-    # Clean target
-    target = target.rstrip('/')
+    # Make sure target has proper scheme
+    target = target.strip()
+    if not target.startswith('http'):
+        target = 'https://' + target
 
-    # If Janitor or the client appended a path after /proxy, add it
+    target = target.rstrip('/') + '/'
+
+    # Decide the final path
     if subpath:
-        full_url = f"{target}/{subpath.lstrip('/')}"
+        path = subpath.lstrip('/')
     else:
-        full_url = target
+        path = 'chat/completions'
 
-    # Preserve other query parameters
-    extra_params = {k: v for k, v in request.args.items() if k != 'url'}
-    if extra_params:
-        full_url += ('&' if '?' in full_url else '?') + urlencode(extra_params)
+    # Properly join the URL (this fixes the https:/ bug)
+    full_url = urljoin(target, path)
+
+    # Add extra query parameters if any
+    extra = {k: v for k, v in request.args.items() if k != 'url'}
+    if extra:
+        full_url += ('&' if '?' in full_url else '?') + urlencode(extra)
 
     # Forward headers
     headers = {}
@@ -73,18 +80,6 @@ def proxy(subpath=None):
 
     except Exception as e:
         return {"error": str(e)}, 500
-
-
-# Catch-all so we can see what path is actually being requested
-@app.route('/<path:path>', methods=['GET', 'POST', 'OPTIONS'])
-def catch_all(path):
-    return {
-        "error": "Route not found",
-        "requested_path": path,
-        "method": request.method,
-        "full_url": request.url,
-        "hint": "You should use /proxy?url=https://integrate.api.nvidia.com/v1"
-    }, 404
 
 
 if __name__ == '__main__':
