@@ -1,120 +1,97 @@
-from flask import Flask, request, Response, stream_with_context
-from flask_cors import CORS
-import requests
 import os
-import re
-from urllib.parse import urljoin, urlencode
+import httpx
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import StreamingResponse
 
-app = Flask(__name__)
-CORS(app)
+app = FastAPI(title="NVIDIA NIM Gemma 4 Fix Proxy")
 
-# Patterns that cause the <channel|> spam
-CHANNEL_PATTERNS = [
-    re.compile(r'<\|channel\|>?', re.IGNORECASE),
-    re.compile(r'<channel\|>', re.IGNORECASE),
-    re.compile(r'<\|channel>thought\n?', re.IGNORECASE),
-    re.compile(r'thought\n?<channel\|>', re.IGNORECASE),
-]
+# ADJUST THIS: 10 to 14 messages stops the Gemma prefill attention crash
+MAX_HISTORY_MESSAGES = 12  
+NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 
-def clean_channel_tokens(text: str) -> str:
-    if not text:
-        return text
-    for pattern in CHANNEL_PATTERNS:
-        text = pattern.sub('', text)
-    # Collapse repeated leftover fragments
-    text = re.sub(r'(channel\|?>?){2,}', '', text, flags=re.IGNORECASE)
-    return text
-
-@app.route('/', methods=['GET'])
-def home():
-    return {
-        "status": "JProxy-style proxy is running (channel tokens stripped)",
-        "usage": "/proxy?url=https://integrate.api.nvidia.com/v1"
-    }
-
-@app.route('/proxy', methods=['GET', 'POST', 'OPTIONS'])
-@app.route('/proxy/', methods=['GET', 'POST', 'OPTIONS'])
-@app.route('/proxy/<path:subpath>', methods=['GET', 'POST', 'OPTIONS'])
-def proxy(subpath=None):
-    if request.method == 'OPTIONS':
-        return Response('', status=204)
-
-    target = request.args.get('url')
-    if not target:
-        return {"error": "Missing ?url= parameter"}, 400
-
-    target = target.strip()
-    if not target.startswith('http'):
-        target = 'https://' + target
-    target = target.rstrip('/') + '/'
-
-    if subpath:
-        path = subpath.lstrip('/')
-    else:
-        path = 'chat/completions'
-
-    full_url = urljoin(target, path)
-
-    extra = {k: v for k, v in request.args.items() if k != 'url'}
-    if extra:
-        full_url += ('&' if '?' in full_url else '?') + urlencode(extra)
-
-    headers = {}
-    for key, value in request.headers:
-        kl = key.lower()
-        if kl not in ['host', 'content-length', 'transfer-encoding', 'connection']:
-            headers[key] = value
+@app.post("/v1/chat/completions")
+async def proxy_chat_completions(request: Request):
+    if not NVIDIA_API_KEY:
+        raise HTTPException(status_code=500, detail="NVIDIA_API_KEY environment variable is missing on Render.")
 
     try:
-        resp = requests.request(
-            method=request.method,
-            url=full_url,
-            headers=headers,
-            data=request.get_data(),
-            stream=True,
-            timeout=300,
-            allow_redirects=False
-        )
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload sent from JanitorAI.")
 
-        excluded = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-        response_headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in excluded]
+    # 1. OPTIMIZATION: Extract the essential text data and strip massive layout arrays
+    if "messages" in payload and isinstance(payload["messages"], list):
+        cleaned_messages = []
+        
+        # Always retain your character card/system instructions
+        system_msg = next((m for m in payload["messages"] if m.get("role") == "system"), None)
+        if system_msg:
+            cleaned_messages.append(system_msg)
+            
+        # Extract the user and bot conversational dialogue
+        chat_history = [m for m in payload["messages"] if m.get("role") != "system"]
+        
+        # 2. OPTIMIZATION: Cut down context length to stop FlashAttention stalls
+        if len(chat_history) > MAX_HISTORY_MESSAGES:
+            chat_history = chat_history[-MAX_HISTORY_MESSAGES:]
+            
+        for msg in chat_history:
+            role = msg.get("role")
+            content = msg.get("content")
+            
+            # If JanitorAI sends structural multi-part text blocks, collapse them into flat strings
+            if isinstance(content, list):
+                text_pieces = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+                content = " ".join(text_pieces)
+            
+            if role and content:
+                cleaned_messages.append({"role": role, "content": str(content)})
+                
+        payload["messages"] = cleaned_messages
 
-        content_type = resp.headers.get('Content-Type', '')
+    # 3. OPTIMIZATION: Clean out conflicting features (biases, deep-chain structures)
+    payload.pop("extra_body", None)
+    payload.pop("logit_bias", None)
+    
+    # Cap excessive generations to prevent the cloud instance from choking midway
+    if payload.get("max_tokens", 0) > 800:
+        payload["max_tokens"] = 800
 
-        def generate():
-            buffer = ''
-            for chunk in resp.iter_content(chunk_size=1024):
-                if not chunk:
-                    continue
-                text = chunk.decode('utf-8', errors='ignore')
-                buffer += text
+    headers = {
+        "Authorization": f"Bearer {NVIDIA_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-                # Clean the buffer
-                cleaned = clean_channel_tokens(buffer)
+    client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
+    is_stream = payload.get("stream", False)
 
-                # Keep a small trailing buffer in case a tag is split across chunks
-                if len(cleaned) > 40:
-                    to_send = cleaned[:-20]
-                    buffer = cleaned[-20:]
-                    if to_send:
-                        yield to_send.encode('utf-8')
-                else:
-                    buffer = cleaned
+    # 4. OPTIMIZATION: Directly feed incoming streaming tokens to eliminate long front-end pauses
+    if is_stream:
+        async def stream_generator():
+            try:
+                async with client.stream("POST", NVIDIA_API_URL, json=payload, headers=headers) as response:
+                    if response.status_code != 200:
+                        yield f"data: {{\"error\": \"Nvidia NIM error code {response.status_code}\"}}\\n\\n".encode("utf-8")
+                        return
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+            except Exception as e:
+                yield f"data: {{\"error\": \"Proxy stream drop: {str(e)}\"}}\\n\\n".encode("utf-8")
+            finally:
+                await client.aclose()
 
-            # Flush remaining
-            if buffer:
-                yield clean_channel_tokens(buffer).encode('utf-8')
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+    else:
+        try:
+            res = await client.post(NVIDIA_API_URL, json=payload, headers=headers)
+            await client.aclose()
+            return res.json()
+        except Exception as e:
+            await client.aclose()
+            raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
 
-        return Response(
-            stream_with_context(generate()),
-            status=resp.status_code,
-            headers=response_headers
-        )
-
-    except Exception as e:
-        return {"error": str(e)}, 500
-
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
