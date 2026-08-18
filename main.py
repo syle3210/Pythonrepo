@@ -6,7 +6,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="NVIDIA NIM Proxy")
 
-# Allow JanitorAI to talk to the proxy
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,18 +42,21 @@ async def proxy_chat_completions(request: Request):
 
     is_stream = payload.get("stream", False)
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
-        if is_stream:
-            async def stream_generator():
+    if is_stream:
+        async def stream_generator():
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0)) as client:
                 async with client.stream("POST", NVIDIA_API_URL, json=payload, headers=headers) as response:
                     if response.status_code != 200:
+                        error_text = await response.aread()
                         yield f"data: {{\"error\": \"NVIDIA error {response.status_code}\"}}\n\n".encode()
                         return
                     async for chunk in response.aiter_bytes():
                         yield chunk
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
-        else:
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+    
+    else:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0)) as client:
             res = await client.post(NVIDIA_API_URL, json=payload, headers=headers)
             if res.status_code != 200:
                 raise HTTPException(status_code=res.status_code, detail=res.text)
