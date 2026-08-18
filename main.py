@@ -2,8 +2,18 @@ import os
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="NVIDIA NIM Proxy")
+
+# Allow JanitorAI to talk to the proxy
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY") or os.getenv("NIM_API_KEY")
@@ -23,7 +33,6 @@ async def proxy_chat_completions(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # Clean only problematic fields
     payload.pop("extra_body", None)
     payload.pop("logit_bias", None)
 
