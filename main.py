@@ -38,25 +38,23 @@ async def proxy_chat_completions(request: Request):
 
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"   # slightly less bot-like
+        "Content-Type": "application/json"
     }
 
     is_stream = payload.get("stream", False)
 
     if is_stream:
         async def stream_generator():
-            for attempt in range(4):
+            for attempt in range(3):
                 try:
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(150.0, connect=25.0)) as client:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0)) as client:
                         async with client.stream("POST", NVIDIA_API_URL, json=payload, headers=headers) as response:
                             if response.status_code == 429:
-                                wait = 20 + (attempt * 20)  # 20s, 40s, 60s, 80s
-                                if attempt < 3:
-                                    await asyncio.sleep(wait)
+                                if attempt < 2:
+                                    await asyncio.sleep((attempt + 1) * 15)
                                     continue
                                 else:
-                                    yield b'data: {"error": "NVIDIA rate limit (429). Please wait 5-10 minutes."}\n\n'
+                                    yield b'data: {"error": "NVIDIA rate limit (429). Please wait a few minutes."}\n\n'
                                     return
 
                             if response.status_code != 200:
@@ -67,22 +65,23 @@ async def proxy_chat_completions(request: Request):
                                 yield chunk
                             return
                 except Exception as e:
-                    if attempt == 3:
+                    if attempt == 2:
                         yield f'data: {{"error": "Proxy error: {str(e)}"}}\n\n'.encode()
 
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
     else:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(150.0, connect=25.0)) as client:
-            for attempt in range(4):
+        # Non-streaming with retry
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0)) as client:
+            for attempt in range(3):
                 res = await client.post(NVIDIA_API_URL, json=payload, headers=headers)
 
                 if res.status_code == 429:
-                    if attempt < 3:
-                        await asyncio.sleep(20 + (attempt * 20))
+                    if attempt < 2:
+                        await asyncio.sleep((attempt + 1) * 15)
                         continue
                     else:
-                        raise HTTPException(status_code=429, detail="NVIDIA rate limit (429). Please wait 5-10 minutes.")
+                        raise HTTPException(status_code=429, detail="NVIDIA rate limit (429). Please wait a few minutes.")
 
                 if res.status_code != 200:
                     raise HTTPException(status_code=res.status_code, detail=res.text)
