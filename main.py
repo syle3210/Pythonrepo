@@ -36,12 +36,23 @@ async def proxy_chat_completions(request: Request):
     payload.pop("extra_body", None)
     payload.pop("logit_bias", None)
 
-    # Enable thinking/reasoning for Gemma models
+# Enable thinking/reasoning for Gemma models (more natural style)
     model_name = (payload.get("model") or "").lower()
     if "gemma" in model_name:
+        # Force thinking
         payload["chat_template_kwargs"] = {
             "enable_thinking": True
         }
+
+        # Light guidance so the thinking feels more natural instead of a checklist
+        if "messages" in payload and isinstance(payload["messages"], list):
+            # Add a short instruction only for the thinking style
+            thinking_guide = {
+                "role": "system",
+                "content": "When thinking, reason naturally in flowing paragraphs or short internal monologue. Avoid bullet-point lists or structured checklists."
+            }
+            # Insert it at the beginning so it influences the thinking
+            payload["messages"].insert(0, thinking_guide)
 
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
