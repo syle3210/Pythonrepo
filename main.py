@@ -36,10 +36,17 @@ async def proxy_chat_completions(request: Request):
     payload.pop("extra_body", None)
     payload.pop("logit_bias", None)
 
+    # Enable thinking/reasoning for Gemma models
+    model_name = (payload.get("model") or "").lower()
+    if "gemma" in model_name:
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": True
+        }
+
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"   # slightly less bot-like
+        "User-Agent": "Mozilla/5.0"
     }
 
     is_stream = payload.get("stream", False)
@@ -51,7 +58,7 @@ async def proxy_chat_completions(request: Request):
                     async with httpx.AsyncClient(timeout=httpx.Timeout(150.0, connect=25.0)) as client:
                         async with client.stream("POST", NVIDIA_API_URL, json=payload, headers=headers) as response:
                             if response.status_code == 429:
-                                wait = 20 + (attempt * 20)  # 20s, 40s, 60s, 80s
+                                wait = 20 + (attempt * 20)
                                 if attempt < 3:
                                     await asyncio.sleep(wait)
                                     continue
