@@ -36,23 +36,12 @@ async def proxy_chat_completions(request: Request):
     payload.pop("extra_body", None)
     payload.pop("logit_bias", None)
 
+    # Enable thinking/reasoning for Gemma models
     model_name = (payload.get("model") or "").lower()
-
-    # Enable thinking for Gemma
     if "gemma" in model_name:
         payload["chat_template_kwargs"] = {
             "enable_thinking": True
         }
-
-    # Stronger activation for MiniMax-M3
-    if "minimax" in model_name:
-        payload["chat_template_kwargs"] = {
-            "enable_thinking": True
-        }
-        # Some MiniMax versions respond better to this extra parameter
-        payload["reasoning"] = True
-
-    # Note: mistral-nemotron removed because it crashes with enable_thinking on free NIM
 
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
