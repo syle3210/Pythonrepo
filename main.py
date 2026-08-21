@@ -36,10 +36,9 @@ async def proxy_chat_completions(request: Request):
     payload.pop("extra_body", None)
     payload.pop("logit_bias", None)
 
+    # Enable thinking/reasoning for Gemma models
     model_name = (payload.get("model") or "").lower()
-
-    # Only force reasoning on MiniMax
-    if "minimax" in model_name:
+    if "gemma" in model_name:
         payload["chat_template_kwargs"] = {
             "enable_thinking": True
         }
