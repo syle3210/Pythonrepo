@@ -38,21 +38,17 @@ async def proxy_chat_completions(request: Request):
 
     model_name = (payload.get("model") or "").lower()
 
-    # Gemma
+    # Enable thinking for Gemma
     if "gemma" in model_name:
         payload["chat_template_kwargs"] = {
             "enable_thinking": True
         }
 
-    # MiniMax M3 - stronger attempt to keep thinking active
+    # Enable thinking for MiniMax M3 only
     if "minimax" in model_name:
         payload["chat_template_kwargs"] = {
             "enable_thinking": True
         }
-        # Extra fallback some MiniMax versions respect more
-        if "extra_body" not in payload:
-            payload["extra_body"] = {}
-        payload["extra_body"]["enable_thinking"] = True
 
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
