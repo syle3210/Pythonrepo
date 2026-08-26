@@ -33,15 +33,26 @@ async def proxy_chat_completions(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
+    # Clean junk fields some clients send
     payload.pop("extra_body", None)
     payload.pop("logit_bias", None)
 
-    # Enable thinking/reasoning for Gemma models
     model_name = (payload.get("model") or "").lower()
+
+    # ---------- Thinking / Reasoning ----------
     if "gemma" in model_name:
-        payload["chat_template_kwargs"] = {
-            "enable_thinking": True
-        }
+        # Official way for Gemma 4 on NIM
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
+        # Optional: also ask NIM to return reasoning in a separate field
+        payload["include_reasoning"] = True
+
+    elif "minimax" in model_name:
+        # Official way for MiniMax M3
+        payload["thinking"] = {"type": "enabled"}   # force thinking every time
+        # Optional: split reasoning into its own field
+        payload["reasoning_split"] = True
+        # Remove the wrong Gemma-style kwargs if present
+        payload.pop("chat_template_kwargs", None)
 
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
@@ -51,23 +62,26 @@ async def proxy_chat_completions(request: Request):
 
     is_stream = payload.get("stream", False)
 
+    # Longer timeout because thinking makes replies much longer
+    timeout = httpx.Timeout(300.0, connect=30.0)
+
     if is_stream:
         async def stream_generator():
             for attempt in range(4):
                 try:
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(150.0, connect=25.0)) as client:
+                    async with httpx.AsyncClient(timeout=timeout) as client:
                         async with client.stream("POST", NVIDIA_API_URL, json=payload, headers=headers) as response:
                             if response.status_code == 429:
                                 wait = 20 + (attempt * 20)
                                 if attempt < 3:
                                     await asyncio.sleep(wait)
                                     continue
-                                else:
-                                    yield b'data: {"error": "NVIDIA rate limit (429). Please wait 5-10 minutes."}\n\n'
-                                    return
+                                yield b'data: {"error": "NVIDIA rate limit (429). Wait 5-10 minutes."}\n\n'
+                                return
 
                             if response.status_code != 200:
-                                yield f'data: {{"error": "NVIDIA error {response.status_code}"}}\n\n'.encode()
+                                body = await response.aread()
+                                yield f'data: {{"error": "NVIDIA error {response.status_code}: {body.decode()[:300]}"}}\n\n'.encode()
                                 return
 
                             async for chunk in response.aiter_bytes():
@@ -76,11 +90,13 @@ async def proxy_chat_completions(request: Request):
                 except Exception as e:
                     if attempt == 3:
                         yield f'data: {{"error": "Proxy error: {str(e)}"}}\n\n'.encode()
+                    else:
+                        await asyncio.sleep(5)
 
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
     else:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(150.0, connect=25.0)) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             for attempt in range(4):
                 res = await client.post(NVIDIA_API_URL, json=payload, headers=headers)
 
@@ -88,10 +104,9 @@ async def proxy_chat_completions(request: Request):
                     if attempt < 3:
                         await asyncio.sleep(20 + (attempt * 20))
                         continue
-                    else:
-                        raise HTTPException(status_code=429, detail="NVIDIA rate limit (429). Please wait 5-10 minutes.")
+                    raise HTTPException(status_code=429, detail="NVIDIA rate limit (429). Wait 5-10 minutes.")
 
                 if res.status_code != 200:
-                    raise HTTPException(status_code=res.status_code, detail=res.text)
+                    raise HTTPException(status_code=res.status_code, detail=res.text[:500])
 
                 return res.json()
