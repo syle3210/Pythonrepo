@@ -33,36 +33,32 @@ async def proxy_chat_completions(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # Clean junk fields some clients send
+    # Remove junk that can break NIM
     payload.pop("extra_body", None)
     payload.pop("logit_bias", None)
+    payload.pop("thinking", None)          # wrong for NIM MiniMax
+    payload.pop("reasoning_split", None)   # MiniMax-native only
+    payload.pop("include_reasoning", None)
 
     model_name = (payload.get("model") or "").lower()
 
-    # ---------- Thinking / Reasoning ----------
+    # ---------- Thinking (NIM-correct) ----------
     if "gemma" in model_name:
-        # Official way for Gemma 4 on NIM
+        # Official for Gemma 4 on NIM
         payload["chat_template_kwargs"] = {"enable_thinking": True}
-        # Optional: also ask NIM to return reasoning in a separate field
-        payload["include_reasoning"] = True
 
     elif "minimax" in model_name:
-        # Official way for MiniMax M3
-        payload["thinking"] = {"type": "enabled"}   # force thinking every time
-        # Optional: split reasoning into its own field
-        payload["reasoning_split"] = True
-        # Remove the wrong Gemma-style kwargs if present
-        payload.pop("chat_template_kwargs", None)
+        # Official for MiniMax M3 on NVIDIA NIM (not MiniMax's own API)
+        payload["chat_template_kwargs"] = {"thinking_mode": "enabled"}
 
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/event-stream" if payload.get("stream") else "application/json",
     }
 
     is_stream = payload.get("stream", False)
-
-    # Longer timeout because thinking makes replies much longer
     timeout = httpx.Timeout(300.0, connect=30.0)
 
     if is_stream:
@@ -76,12 +72,13 @@ async def proxy_chat_completions(request: Request):
                                 if attempt < 3:
                                     await asyncio.sleep(wait)
                                     continue
-                                yield b'data: {"error": "NVIDIA rate limit (429). Wait 5-10 minutes."}\n\n'
+                                yield b'data: {"error":{"message":"NVIDIA rate limit (429). Wait 5-10 min."}}\n\n'
                                 return
 
                             if response.status_code != 200:
                                 body = await response.aread()
-                                yield f'data: {{"error": "NVIDIA error {response.status_code}: {body.decode()[:300]}"}}\n\n'.encode()
+                                msg = body.decode(errors="ignore")[:400].replace('"', "'")
+                                yield f'data: {{"error":{{"message":"NVIDIA {response.status_code}: {msg}"}}}}\n\n'.encode()
                                 return
 
                             async for chunk in response.aiter_bytes():
@@ -89,7 +86,7 @@ async def proxy_chat_completions(request: Request):
                             return
                 except Exception as e:
                     if attempt == 3:
-                        yield f'data: {{"error": "Proxy error: {str(e)}"}}\n\n'.encode()
+                        yield f'data: {{"error":{{"message":"Proxy error: {str(e)}"}}}}\n\n'.encode()
                     else:
                         await asyncio.sleep(5)
 
@@ -104,7 +101,7 @@ async def proxy_chat_completions(request: Request):
                     if attempt < 3:
                         await asyncio.sleep(20 + (attempt * 20))
                         continue
-                    raise HTTPException(status_code=429, detail="NVIDIA rate limit (429). Wait 5-10 minutes.")
+                    raise HTTPException(status_code=429, detail="NVIDIA rate limit (429)")
 
                 if res.status_code != 200:
                     raise HTTPException(status_code=res.status_code, detail=res.text[:500])
